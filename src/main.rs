@@ -15,9 +15,18 @@ struct ItemStack {
     #[serde(alias = "m")]
     pub metadata: i32,
     #[serde(alias = "uN")]
-    pub unlocalized_name: String,
+    pub unlocalized_name: Option<String>,
     #[serde(alias = "lN")]
-    pub localized_name: String,
+    pub localized_name: Option<String>,
+}
+
+impl ItemStack {
+    pub fn is_missing(&self) -> bool {
+        self.unlocalized_name == None
+            || self.localized_name == None
+            || self.unlocalized_name.as_ref().map(|s| s.as_str()) == Some("tile.fire")
+            || self.localized_name.as_ref().map(|s| s.as_str()) == Some("Fire")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -25,9 +34,15 @@ struct FluidStack {
     #[serde(alias = "a")]
     pub amount: i32,
     #[serde(alias = "uN")]
-    pub unlocalized_name: String,
+    pub unlocalized_name: Option<String>,
     #[serde(alias = "lN")]
-    pub localized_name: String,
+    pub localized_name: Option<String>,
+}
+
+impl FluidStack {
+    pub fn is_missing(&self) -> bool {
+        self.unlocalized_name == None || self.localized_name == None
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -46,6 +61,15 @@ struct GTRecipe {
     pub item_outputs: Vec<ItemStack>,
     #[serde(alias = "fO", skip_serializing_if = "Vec::is_empty")]
     pub fluid_outputs: Vec<FluidStack>,
+}
+
+impl GTRecipe {
+    pub fn has_missing(&self) -> bool {
+        self.item_inputs.iter().any(ItemStack::is_missing)
+            || self.fluid_inputs.iter().any(FluidStack::is_missing)
+            || self.item_outputs.iter().any(ItemStack::is_missing)
+            || self.fluid_outputs.iter().any(FluidStack::is_missing)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,6 +226,27 @@ enum GTRecipeStatus {
     ConflictCreated,
     ConflictRemoved,
     DuplicateRegistration,
+    MissingInput,
+    MissingOutput,
+    MissingOutputCreated,
+}
+
+impl ToString for GTRecipeStatus {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Added => "Added".to_owned(),
+            Self::Removed => "Removed".to_owned(),
+            Self::OutputsChanged => "Outputs Changed".to_owned(),
+            Self::StatsChanged => "Stats Changed".to_owned(),
+            Self::Conflicting => "Conflicting".to_owned(),
+            Self::ConflictCreated => "Conflict Created".to_owned(),
+            Self::ConflictRemoved => "Conflict Removed".to_owned(),
+            Self::DuplicateRegistration => "Duplicate Registration".to_owned(),
+            Self::MissingInput => "Missing Input".to_owned(),
+            Self::MissingOutput => "Missing Output".to_owned(),
+            Self::MissingOutputCreated => "Missing Output Created".to_owned(),
+        }
+    }
 }
 
 type RecipeKey = (Vec<ItemStack>, Vec<FluidStack>);
@@ -242,6 +287,42 @@ fn analyze<'a>(
         for key in keys {
             let before_recipe_list = before_recipes.get(key);
             let after_recipe_list = after_recipes.get(key);
+
+            if key.0.iter().any(ItemStack::is_missing) || key.1.iter().any(FluidStack::is_missing) {
+                machine_statuses.push((
+                    key.clone(),
+                    before_recipe_list.cloned().unwrap_or_else(Vec::new),
+                    after_recipe_list.cloned().unwrap_or_else(Vec::new),
+                    GTRecipeStatus::MissingInput,
+                ));
+                continue;
+            }
+
+            let before_has_missing = if let Some(b) = before_recipe_list {
+                b.iter().copied().any(GTRecipe::has_missing)
+            } else {
+                false
+            };
+
+            let after_has_missing = if let Some(a) = after_recipe_list {
+                a.iter().copied().any(GTRecipe::has_missing)
+            } else {
+                false
+            };
+
+            if after_has_missing {
+                machine_statuses.push((
+                    key.clone(),
+                    before_recipe_list.cloned().unwrap_or_else(Vec::new),
+                    after_recipe_list.cloned().unwrap_or_else(Vec::new),
+                    if before_has_missing {
+                        GTRecipeStatus::MissingOutput
+                    } else {
+                        GTRecipeStatus::MissingOutputCreated
+                    },
+                ));
+                continue;
+            }
 
             let before_has_conflict = before_recipe_list.map(|v| v.len() > 1).unwrap_or(false);
             let after_has_conflict = after_recipe_list.map(|v| v.len() > 1).unwrap_or(false);
@@ -407,11 +488,20 @@ fn main() {
         panic!("cannot use --blacklist and --whitelist at the same time");
     }
 
-    let before = Root::load(&args.before);
-    let after = match &args.after {
-        Some(x) => Root::load(x),
-        None => before.clone(),
-    };
+    let before;
+    let after;
+
+    if let Some(a) = args.after.as_ref() {
+        (before, after) = std::thread::scope(|x| {
+            let bh = x.spawn(|| Root::load(&args.before));
+            let ah = x.spawn(|| Root::load(a));
+
+            (bh.join().unwrap(), ah.join().unwrap())
+        });
+    } else {
+        before = Root::load(&args.before);
+        after = before.clone();
+    }
 
     println!("finding gt recipes");
 
@@ -430,6 +520,22 @@ fn main() {
         if args.whitelist.len() > 0 {
             machine.retain(|k, _| args.whitelist.contains(k));
         }
+    }
+
+    println!("summary:");
+
+    let summary = status
+        .iter()
+        .flat_map(|(_, recipe)| recipe.iter())
+        .map(|(recipe_status, recipes)| (recipe_status, recipes.len()))
+        .into_group_map()
+        .into_iter()
+        .map(|(recipe_status, counts)| (recipe_status, counts.into_iter().sum::<usize>()))
+        .collect::<HashMap<_, _>>();
+
+    for (status, count) in summary {
+        let status = status.to_string();
+        println!("{status}: {count}");
     }
 
     println!("writing {:?}", args.output);
